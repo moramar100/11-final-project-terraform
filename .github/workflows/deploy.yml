@@ -1,1 +1,207 @@
-# The pipeline (contracts P1-P11). Fill it in. Until it has on: and jobs:, GitHub shows it as an invalid workflow
+name: Voting app CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+  push:
+    branches: [main]
+    paths:
+      - "services/**"
+      - "infra/**"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: eu-north-1
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - name: Check formatting
+        run: terraform fmt -check -recursive
+      - name: Validate Terraform
+        working-directory: infra
+        run: |
+          terraform init -backend=false
+          terraform validate
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Build and publish service images
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ github.sha }}
+          SHOULD_PUSH: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        run: |
+          for service in vote result worker; do
+            repository="${NAME_PREFIX}-${service}"
+            if [ "$SHOULD_PUSH" = "true" ] && aws ecr describe-images --repository-name "$repository" --image-ids imageTag="$IMAGE_TAG" >/dev/null 2>&1; then
+              echo "${repository}:${IMAGE_TAG} already exists; skipping immutable tag."
+              continue
+            fi
+            docker buildx build --platform linux/amd64 --load -t "${REGISTRY}/${repository}:${IMAGE_TAG}" "services/${service}"
+            if [ "$SHOULD_PUSH" = "true" ]; then
+              docker push "${REGISTRY}/${repository}:${IMAGE_TAG}"
+            fi
+          done
+
+  plan:
+    if: github.event_name == 'pull_request'
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    strategy:
+      matrix:
+        environment: [dev, prod]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Plan ${{ matrix.environment }}
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_ENV: ${{ matrix.environment }}
+        run: |
+          terraform init \
+            -backend-config="bucket=${TF_STATE_BUCKET}" \
+            -backend-config="key=voting-app/${DEPLOY_ENV}/terraform.tfstate" \
+            -backend-config="region=${AWS_REGION}" \
+            -backend-config="use_lockfile=true"
+          terraform plan -var-file="envs/${DEPLOY_ENV}.tfvars" -var="name_prefix=${NAME_PREFIX}" -var="image_tag=${IMAGE_TAG}"
+
+  deploy-dev:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: voting-app-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy dev
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          terraform init -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="key=voting-app/dev/terraform.tfstate" -backend-config="region=${AWS_REGION}" -backend-config="use_lockfile=true"
+          terraform apply -auto-approve -var-file=envs/dev.tfvars -var="name_prefix=${NAME_PREFIX}" -var="image_tag=${IMAGE_TAG}"
+      - name: Smoke test and verify deployed version
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          vote_url=$(terraform output -raw vote_url)
+          result_url=$(terraform output -raw result_url)
+          curl --fail --silent --show-error --retry 20 --retry-delay 15 --retry-connrefused "${vote_url}/healthz"
+          curl --fail --silent --show-error --retry 20 --retry-delay 15 --retry-connrefused "${result_url}/healthz"
+          set +e
+          terraform plan -detailed-exitcode -var-file=envs/dev.tfvars -var="name_prefix=${NAME_PREFIX}" -var="image_tag=${IMAGE_TAG}" -out=version-check.tfplan
+          result=$?
+          set -e
+          if [ "$result" -ne 0 ]; then
+            echo "Version check expected no changes (exit 0), got ${result}."
+            exit 1
+          fi
+
+  deploy-prod:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [checks, build, deploy-dev]
+    runs-on: ubuntu-latest
+    environment: prod
+    concurrency:
+      group: voting-app-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Deploy prod
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          terraform init -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="key=voting-app/prod/terraform.tfstate" -backend-config="region=${AWS_REGION}" -backend-config="use_lockfile=true"
+          terraform apply -auto-approve -var-file=envs/prod.tfvars -var="name_prefix=${NAME_PREFIX}" -var="image_tag=${IMAGE_TAG}"
+      - name: Smoke test and verify deployed version
+        working-directory: infra
+        env:
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+        run: |
+          vote_url=$(terraform output -raw vote_url)
+          result_url=$(terraform output -raw result_url)
+          curl --fail --silent --show-error --retry 20 --retry-delay 15 --retry-connrefused "${vote_url}/healthz"
+          curl --fail --silent --show-error --retry 20 --retry-delay 15 --retry-connrefused "${result_url}/healthz"
+          set +e
+          terraform plan -detailed-exitcode -var-file=envs/prod.tfvars -var="name_prefix=${NAME_PREFIX}" -var="image_tag=${IMAGE_TAG}" -out=version-check.tfplan
+          result=$?
+          set -e
+          if [ "$result" -ne 0 ]; then
+            echo "Version check expected no changes (exit 0), got ${result}."
+            exit 1
+          fi
