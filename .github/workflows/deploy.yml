@@ -1,4 +1,5 @@
 name: Voting app CI/CD
+# Build each commit once, deploy that image to dev, then gate its promotion to prod.
 
 on:
   pull_request:
