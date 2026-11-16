@@ -1,5 +1,6 @@
 .terraform/
 *.tfstate*
+*.tfplan
 *.zip
 __pycache__/
 node_modules/
